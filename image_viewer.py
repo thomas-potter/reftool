@@ -1,72 +1,43 @@
 #!/usr/bin/env python3
-"""Simple image viewer GUI for Linux with timed slideshow and shuffle."""
+"""Modern image viewer GUI for Linux with timed slideshow, shuffle, and rotation.
+
+Uses customtkinter for a clean SaaS aesthetic and loads images in
+background threads so the UI never freezes.
+"""
 
 import os
+import platform
 import random
+import subprocess
+import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import messagebox
+
+import customtkinter as ctk
 from PIL import Image, ImageTk
 
-# ---------------------------------------------------------------------------
-# Theme colours (dark mode inverted)
-# ---------------------------------------------------------------------------
-BG = "#1F1E1D"          # Dark Brown-Gray (was FG, now background)
-FG = "#FAF9F5"          # Warm Off-White (was BG, now foreground/text)
-ACCENT = "#1C6BBB"      # Claude Blue
-EMPHASIS = "#C96442"    # Terracotta Orange
-DISABLED = "#A0A0A8"    # Lighter Gray for dark mode readability
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("dark-blue")
 
-CANVAS_BG = "#141312"   # Slightly darker than BG for image canvas
-ENTRY_BG = "#2A2928"    # Darker input field background
-
-BUTTON_STYLE = {
-    "bg": ACCENT,
-    "fg": "#FFFFFF",
-    "activebackground": "#155A9E",
-    "activeforeground": "#FFFFFF",
-    "bd": 0,
-    "padx": 14,
-    "pady": 8,
-    "font": ("Helvetica", 11, "bold"),
-    "cursor": "hand2",
+INTERVAL_MAP = {
+    "5s": 5_000,
+    "15s": 15_000,
+    "30s": 30_000,
+    "1m": 60_000,
 }
 
-TOGGLE_ON_STYLE = {
-    "bg": EMPHASIS,
-    "fg": "#FFFFFF",
-    "activebackground": "#A65338",
-    "activeforeground": "#FFFFFF",
-    "bd": 0,
-    "padx": 14,
-    "pady": 8,
-    "font": ("Helvetica", 11, "bold"),
-    "cursor": "hand2",
-}
 
-LABEL_STYLE = {
-    "bg": BG,
-    "fg": FG,
-    "font": ("Helvetica", 11),
-}
-
-SMALL_LABEL_STYLE = {
-    "bg": BG,
-    "fg": FG,
-    "font": ("Helvetica", 10),
-}
-
-# ---------------------------------------------------------------------------
-# App
-# ---------------------------------------------------------------------------
 class ImageViewerApp:
     IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif"}
 
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: ctk.CTk):
         self.root = root
         self.root.title("Image Viewer")
-        self.root.configure(bg=BG)
-        self.root.geometry("900x650")
-        self.root.minsize(600, 400)
+        self.root.geometry("1100x750")
+        self.root.minsize(750, 500)
+
+        self.root.grid_rowconfigure(0, weight=1)
+        self.root.grid_columnconfigure(0, weight=1)
 
         # State
         self.images: list[str] = []
@@ -77,8 +48,12 @@ class ImageViewerApp:
         self.paused: bool = False
         self.time_remaining_ms: int = 0
         self.after_id: str | None = None
+        self.resize_after_id: str | None = None
         self.photo_image: ImageTk.PhotoImage | None = None
         self.subfolders: bool = True
+        self._loading: bool = False
+        self._image_load_counter: int = 0
+        self._rotation_angle: int = 0
 
         # Build screens
         self._build_setup_screen()
@@ -87,353 +62,412 @@ class ImageViewerApp:
         self._show_setup()
 
         # Keyboard shortcuts
-        self.root.bind("<Escape>", lambda e: self._show_setup())
-        self.root.bind("<Left>", lambda e: self._go_back())
-        self.root.bind("<Right>", lambda e: self._advance())
-        self.root.bind("<space>", lambda e: self._toggle_pause())
-        self.root.bind("<Configure>", lambda e: self._on_resize())
+        self.root.bind("<Escape>", lambda _e: self._show_setup())
+        self.root.bind("<Left>", lambda _e: self._go_back())
+        self.root.bind("<Right>", lambda _e: self._advance())
+        self.root.bind("<space>", lambda _e: self._toggle_pause())
+        self.root.bind("<r>", lambda _e: self._rotate_right())
+        self.root.bind("<R>", lambda _e: self._rotate_left())
+        self.root.bind("<Configure>", self._on_resize)
 
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Setup screen
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------
     def _build_setup_screen(self):
-        self.setup_frame = tk.Frame(self.root, bg=BG)
+        self.setup_frame = ctk.CTkFrame(self.root, fg_color="transparent")
+        self.setup_frame.grid(row=0, column=0, sticky="nsew")
+        self.setup_frame.grid_rowconfigure(0, weight=1)
+        self.setup_frame.grid_columnconfigure(0, weight=1)
+
+        # Card
+        card = ctk.CTkFrame(self.setup_frame, corner_radius=20, border_width=0)
+        card.grid(row=0, column=0, padx=60, pady=60, sticky="")
 
         # Title
-        tk.Label(
-            self.setup_frame,
+        ctk.CTkLabel(
+            card,
             text="Image Viewer",
-            bg=BG,
-            fg=FG,
-            font=("Helvetica", 28, "bold"),
-        ).pack(pady=(40, 10))
+            font=("Inter", 36, "bold"),
+        ).pack(pady=(35, 5))
+
+        ctk.CTkLabel(
+            card,
+            text="Pick a folder and enjoy your slideshow",
+            font=("Inter", 14),
+            text_color="gray60",
+        ).pack(pady=(0, 25))
 
         # Folder selection
-        folder_frame = tk.Frame(self.setup_frame, bg=BG)
-        folder_frame.pack(pady=20, padx=40, fill=tk.X)
+        folder_row = ctk.CTkFrame(card, fg_color="transparent")
+        folder_row.pack(padx=35, pady=8, fill="x")
 
-        self.folder_path_var = tk.StringVar()
-        tk.Entry(
-            folder_frame,
+        self.folder_path_var = ctk.StringVar()
+        self.folder_entry = ctk.CTkEntry(
+            folder_row,
             textvariable=self.folder_path_var,
             state="readonly",
-            bg=ENTRY_BG,
-            fg=FG,
-            font=("Helvetica", 11),
-            relief="solid",
-            bd=1,
-            highlightthickness=0,
-            insertbackground=FG,
-        ).pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4, padx=(0, 8))
+            width=420,
+            height=40,
+            font=("Inter", 13),
+            corner_radius=10,
+        )
+        self.folder_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
 
-        tk.Button(
-            folder_frame,
+        ctk.CTkButton(
+            folder_row,
             text="Browse…",
             command=self._browse_folder,
-            **BUTTON_STYLE,
-        ).pack(side=tk.RIGHT)
+            width=100,
+            height=40,
+            font=("Inter", 13, "bold"),
+            corner_radius=10,
+        ).pack(side="right")
 
-        # Subfolders toggle
-        self.subfolders_var = tk.BooleanVar(value=True)
-        sub_cb = tk.Checkbutton(
-            self.setup_frame,
+        # Subfolders switch
+        self.subfolders_var = ctk.BooleanVar(value=True)
+        ctk.CTkSwitch(
+            card,
             text="Include subfolders",
             variable=self.subfolders_var,
-            bg=BG,
-            fg=FG,
-            activebackground=BG,
-            activeforeground=FG,
-            selectcolor=ENTRY_BG,
-            font=("Helvetica", 11),
-            cursor="hand2",
-        )
-        sub_cb.pack(pady=(0, 20))
+            font=("Inter", 13),
+            progress_color="#6366f1",
+        ).pack(pady=(20, 5), padx=35, anchor="w")
 
         # Interval selection
-        interval_frame = tk.LabelFrame(
-            self.setup_frame,
-            text=" Slideshow timing ",
-            bg=BG,
-            fg=FG,
-            font=("Helvetica", 12, "bold"),
-            bd=1,
-        )
-        interval_frame.pack(padx=40, pady=10, fill=tk.X)
+        timing_frame = ctk.CTkFrame(card, fg_color="transparent")
+        timing_frame.pack(padx=35, pady=15, fill="x")
 
-        # Untimed checkbox
-        self.untimed_var = tk.BooleanVar(value=True)
-        untimed_cb = tk.Checkbutton(
-            interval_frame,
-            text="Untimed (manual navigation only)",
-            variable=self.untimed_var,
-            bg=BG,
-            fg=FG,
-            activebackground=BG,
-            activeforeground=FG,
-            selectcolor=ENTRY_BG,
-            font=("Helvetica", 11),
-            cursor="hand2",
-            command=self._on_untimed_toggle,
-        )
-        untimed_cb.pack(anchor=tk.W, padx=10, pady=(8, 0))
+        ctk.CTkLabel(
+            timing_frame,
+            text="Slideshow timing",
+            font=("Inter", 14, "bold"),
+        ).pack(anchor="w", pady=(0, 10))
 
-        # Slider row
-        self.slider_frame = tk.Frame(interval_frame, bg=BG)
-        self.slider_frame.pack(fill=tk.X, padx=10, pady=(5, 10))
-
-        self.interval_var = tk.IntVar(value=30)
-        self.interval_scale = tk.Scale(
-            self.slider_frame,
-            from_=30,
-            to=600,
-            orient=tk.HORIZONTAL,
+        self.interval_var = ctk.StringVar(value="Untimed")
+        self.interval_seg = ctk.CTkSegmentedButton(
+            timing_frame,
+            values=["5s", "15s", "30s", "1m", "Untimed"],
             variable=self.interval_var,
-            bg=BG,
-            fg=FG,
-            troughcolor="#3A3938",
-            highlightthickness=0,
-            activebackground=ACCENT,
-            sliderlength=20,
-            length=400,
-            command=self._on_slider_change,
+            command=self._on_interval_change,
+            height=34,
+            font=("Inter", 13, "bold"),
+            corner_radius=10,
         )
-        self.interval_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        self.interval_label = tk.Label(
-            self.slider_frame,
-            text="30 seconds",
-            **LABEL_STYLE,
-        )
-        self.interval_label.pack(side=tk.RIGHT, padx=(10, 0))
-
-        self._on_untimed_toggle()
-
-        # Image count label
-        self.count_label = tk.Label(
-            self.setup_frame,
-            text="No folder selected",
-            **SMALL_LABEL_STYLE,
-        )
-        self.count_label.pack(pady=(10, 5))
+        self.interval_seg.pack(fill="x")
 
         # Start button
-        self.start_btn = tk.Button(
-            self.setup_frame,
+        ctk.CTkButton(
+            card,
             text="Start Slideshow",
             command=self._start_slideshow,
-            **BUTTON_STYLE,
-        )
-        self.start_btn.pack(pady=20)
+            height=44,
+            font=("Inter", 15, "bold"),
+            fg_color="#6366f1",
+            hover_color="#4f46e5",
+            corner_radius=12,
+        ).pack(pady=(20, 35), padx=35, fill="x")
 
     def _browse_folder(self):
-        path = filedialog.askdirectory(title="Select Image Folder")
-        if not path:
-            return
-        self.folder_path_var.set(path)
-        self._refresh_image_count()
+        """Use a native Linux file picker when possible, else fall back."""
+        chosen = ""
+        if platform.system() == "Linux":
+            try:
+                result = subprocess.run(
+                    ["zenity", "--file-selection", "--directory"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if result.returncode == 0:
+                    chosen = result.stdout.strip()
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
 
-    def _refresh_image_count(self):
-        path = self.folder_path_var.get()
-        if not path:
-            self.count_label.config(text="No folder selected")
-            return
-        self._load_images(path)
-        if self.images:
-            self.count_label.config(
-                text=f"{len(self.images)} image(s) found",
-                fg="#4CAF50",
-            )
-        else:
-            self.count_label.config(
-                text="No images found in selected folder",
-                fg=EMPHASIS,
-            )
+        if not chosen:
+            import tkinter.filedialog as filedialog
 
-    def _on_untimed_toggle(self):
-        if self.untimed_var.get():
-            self.interval_scale.config(state=tk.DISABLED, troughcolor="#3A3938")
-            self.interval_label.config(fg=DISABLED)
-        else:
-            self.interval_scale.config(state=tk.NORMAL, troughcolor="#3A3938")
-            self.interval_label.config(fg=FG)
+            chosen = filedialog.askdirectory()
 
-    def _on_slider_change(self, value):
-        seconds = int(float(value))
-        self.interval_label.config(text=self._format_time(seconds))
+        if chosen:
+            self.folder_path_var.set(chosen)
 
-    @staticmethod
-    def _format_time(seconds: int) -> str:
-        if seconds < 60:
-            return f"{seconds} second{'s' if seconds != 1 else ''}"
-        mins = seconds // 60
-        secs = seconds % 60
-        if secs == 0:
-            return f"{mins} minute{'s' if mins != 1 else ''}"
-        return f"{mins}m {secs}s"
-
-    # -----------------------------------------------------------------------
-    # Slideshow screen
-    # -----------------------------------------------------------------------
-    def _build_slideshow_screen(self):
-        self.slideshow_frame = tk.Frame(self.root, bg=BG)
-        self.slideshow_frame.grid_rowconfigure(0, weight=1)
-        self.slideshow_frame.grid_columnconfigure(0, weight=1)
-
-        # Canvas for image
-        self.canvas = tk.Canvas(
-            self.slideshow_frame,
-            bg=CANVAS_BG,
-            highlightthickness=0,
-        )
-        self.canvas.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
-
-        # Bottom toolbar
-        toolbar = tk.Frame(self.slideshow_frame, bg=BG, height=60)
-        toolbar.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
-        toolbar.grid_propagate(False)
-
-        self.prev_btn = tk.Button(
-            toolbar,
-            text="← Previous",
-            command=self._go_back,
-            **BUTTON_STYLE,
-        )
-        self.prev_btn.place(relx=0.05, rely=0.5, anchor="w")
-
-        self.pause_btn = tk.Button(
-            toolbar,
-            text="Pause",
-            command=self._toggle_pause,
-            **TOGGLE_ON_STYLE,
-        )
-        self.pause_btn.place(relx=0.35, rely=0.5, anchor="c")
-
-        self.countdown_label = tk.Label(
-            toolbar,
-            text="",
-            bg=BG,
-            fg=FG,
-            font=("Helvetica", 12, "bold"),
-        )
-        self.countdown_label.place(relx=0.5, rely=0.5, anchor="c")
-
-        self.shuffle_btn = tk.Button(
-            toolbar,
-            text="Shuffle: OFF",
-            command=self._toggle_shuffle,
-            **BUTTON_STYLE,
-        )
-        self.shuffle_btn.place(relx=0.65, rely=0.5, anchor="c")
-
-        self.next_btn = tk.Button(
-            toolbar,
-            text="Next →",
-            command=self._advance,
-            **BUTTON_STYLE,
-        )
-        self.next_btn.place(relx=0.95, rely=0.5, anchor="e")
-
-        # Filename label above toolbar
-        self.filename_label = tk.Label(
-            self.slideshow_frame,
-            text="",
-            bg=BG,
-            fg=DISABLED,
-            font=("Helvetica", 10),
-        )
-        self.filename_label.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 5))
-
-    # -----------------------------------------------------------------------
-    # Navigation & logic
-    # -----------------------------------------------------------------------
-    def _load_images(self, root_path: str):
-        self.images = []
-        if self.subfolders_var.get():
-            for dirpath, _, filenames in os.walk(root_path):
-                for name in filenames:
-                    if os.path.splitext(name)[1].lower() in self.IMAGE_EXTS:
-                        self.images.append(os.path.join(dirpath, name))
-        else:
-            for name in os.listdir(root_path):
-                full = os.path.join(root_path, name)
-                if os.path.isfile(full) and os.path.splitext(name)[1].lower() in self.IMAGE_EXTS:
-                    self.images.append(full)
-        self.images.sort()
-        if self.shuffle:
-            random.shuffle(self.images)
+    def _on_interval_change(self, value: str):
+        self.untimed = value == "Untimed"
+        self.interval_ms = INTERVAL_MAP.get(value, 30_000)
 
     def _start_slideshow(self):
-        path = self.folder_path_var.get()
-        if not path:
-            messagebox.showwarning("No folder", "Please select a folder first.")
-            return
-        self.subfolders = self.subfolders_var.get()
-        self._load_images(path)
-        if not self.images:
-            messagebox.showwarning("No images", "No supported images found in the selected folder.")
+        folder = self.folder_path_var.get()
+        if not folder or not os.path.isdir(folder):
+            messagebox.showerror("Error", "Please select a valid folder.")
             return
 
-        self.untimed = self.untimed_var.get()
-        self.interval_ms = self.interval_var.get() * 1_000
+        self.subfolders = self.subfolders_var.get()
+        self._load_images(folder)
+
+        if not self.images:
+            messagebox.showinfo(
+                "No images", "No supported images found in the selected folder."
+            )
+            return
+
         self.current_index = 0
         self.paused = False
         self.time_remaining_ms = self.interval_ms
-
+        self._rotation_angle = 0
         self._show_slideshow()
         self._show_image(0)
         if not self.untimed:
             self._schedule_tick()
 
+    def _load_images(self, folder: str):
+        self.images = []
+        if self.subfolders:
+            for root, _dirs, files in os.walk(folder):
+                for f in files:
+                    if os.path.splitext(f)[1].lower() in self.IMAGE_EXTS:
+                        self.images.append(os.path.join(root, f))
+        else:
+            for f in os.listdir(folder):
+                if os.path.splitext(f)[1].lower() in self.IMAGE_EXTS:
+                    self.images.append(os.path.join(folder, f))
+        self.images.sort(key=lambda p: os.path.basename(p).lower())
+        if self.shuffle:
+            random.shuffle(self.images)
+
+    # ------------------------------------------------------------------
+    # Slideshow screen
+    # ------------------------------------------------------------------
+    def _build_slideshow_screen(self):
+        self.slideshow_frame = ctk.CTkFrame(self.root, fg_color="transparent")
+        self.slideshow_frame.grid_rowconfigure(0, weight=1)
+        self.slideshow_frame.grid_columnconfigure(0, weight=1)
+
+        # Image canvas
+        self.canvas = tk.Canvas(
+            self.slideshow_frame,
+            bg="#0e0e0e",
+            highlightthickness=0,
+            bd=0,
+        )
+        self.canvas.grid(row=0, column=0, sticky="nsew", padx=12, pady=(12, 0))
+
+        # Bottom toolbar
+        toolbar = ctk.CTkFrame(self.slideshow_frame, fg_color="transparent", height=70)
+        toolbar.grid(row=1, column=0, sticky="ew", padx=12, pady=(8, 12))
+        toolbar.grid_propagate(False)
+
+        # Left info
+        info_frame = ctk.CTkFrame(toolbar, fg_color="transparent")
+        info_frame.place(rely=0.5, relx=0.02, anchor="w")
+
+        self.filename_label = ctk.CTkLabel(
+            info_frame, text="", font=("Inter", 13), text_color="gray70"
+        )
+        self.filename_label.pack(anchor="w")
+
+        self.countdown_label = ctk.CTkLabel(
+            info_frame, text="", font=("Inter", 13, "bold"), text_color="#6366f1"
+        )
+        self.countdown_label.pack(anchor="w")
+
+        # Right controls
+        ctrl_frame = ctk.CTkFrame(toolbar, fg_color="transparent")
+        ctrl_frame.place(rely=0.5, relx=0.98, anchor="e")
+
+        self.rotate_left_btn = ctk.CTkButton(
+            ctrl_frame,
+            text="⟲",
+            command=self._rotate_left,
+            width=40,
+            height=34,
+            font=("Inter", 16),
+            corner_radius=10,
+            fg_color="transparent",
+            border_width=1,
+            text_color="gray80",
+            hover_color="#2a2a2a",
+        )
+        self.rotate_left_btn.pack(side="left", padx=4)
+
+        self.rotate_right_btn = ctk.CTkButton(
+            ctrl_frame,
+            text="⟳",
+            command=self._rotate_right,
+            width=40,
+            height=34,
+            font=("Inter", 16),
+            corner_radius=10,
+            fg_color="transparent",
+            border_width=1,
+            text_color="gray80",
+            hover_color="#2a2a2a",
+        )
+        self.rotate_right_btn.pack(side="left", padx=4)
+
+        self.shuffle_btn = ctk.CTkButton(
+            ctrl_frame,
+            text="Shuffle: OFF",
+            command=self._toggle_shuffle,
+            width=110,
+            height=34,
+            font=("Inter", 12),
+            corner_radius=10,
+            fg_color="transparent",
+            border_width=1,
+            text_color="gray80",
+            hover_color="#2a2a2a",
+        )
+        self.shuffle_btn.pack(side="left", padx=4)
+
+        self.prev_btn = ctk.CTkButton(
+            ctrl_frame,
+            text="← Prev",
+            command=self._go_back,
+            width=80,
+            height=34,
+            font=("Inter", 12, "bold"),
+            corner_radius=10,
+        )
+        self.prev_btn.pack(side="left", padx=4)
+
+        self.pause_btn = ctk.CTkButton(
+            ctrl_frame,
+            text="Pause",
+            command=self._toggle_pause,
+            width=90,
+            height=34,
+            font=("Inter", 12, "bold"),
+            corner_radius=10,
+            fg_color="#6366f1",
+            hover_color="#4f46e5",
+        )
+        self.pause_btn.pack(side="left", padx=4)
+
+        self.next_btn = ctk.CTkButton(
+            ctrl_frame,
+            text="Next →",
+            command=self._advance,
+            width=80,
+            height=34,
+            font=("Inter", 12, "bold"),
+            corner_radius=10,
+        )
+        self.next_btn.pack(side="left", padx=4)
+
+    # ------------------------------------------------------------------
+    # Image display (threaded so UI stays responsive)
+    # ------------------------------------------------------------------
     def _show_image(self, index: int):
         if not self.images:
             return
         self.current_index = index % len(self.images)
         path = self.images[self.current_index]
-        self.filename_label.config(text=os.path.basename(path))
+        self.filename_label.configure(text=os.path.basename(path))
 
+        cw = max(self.canvas.winfo_width(), 1)
+        ch = max(self.canvas.winfo_height(), 1)
+
+        # Loading state
+        self._loading = True
+        self.canvas.delete("all")
+        self.canvas.create_text(
+            cw // 2,
+            ch // 2,
+            text="Loading…",
+            fill="#555555",
+            font=("Inter", 18),
+            tags="loading",
+        )
+
+        # Cancel stale loads
+        self._image_load_counter += 1
+        counter = self._image_load_counter
+
+        # Load + resize in background thread
+        thread = threading.Thread(
+            target=self._load_image_worker,
+            args=(path, cw, ch, counter, self._rotation_angle),
+            daemon=True,
+        )
+        thread.start()
+
+    def _load_image_worker(self, path: str, cw: int, ch: int, counter: int, angle: int):
         try:
             pil_img = Image.open(path)
-            pil_img = self._resize_to_fit(pil_img)
-            self.photo_image = ImageTk.PhotoImage(pil_img)
+            if angle:
+                pil_img = pil_img.rotate(angle, expand=True)
+            pil_img = self._resize_to_fit(pil_img, cw, ch)
+            self.root.after(0, lambda: self._on_image_loaded(pil_img, counter))
         except Exception as exc:
-            self.photo_image = None
-            self.canvas.delete("all")
-            self.canvas.create_text(
-                self.canvas.winfo_width() // 2,
-                self.canvas.winfo_height() // 2,
-                text=f"Unable to load image:\n{exc}",
-                fill=EMPHASIS,
-                font=("Helvetica", 12),
-                justify=tk.CENTER,
-            )
-            return
+            self.root.after(0, lambda e=exc: self._on_image_error(e, counter))
 
+    def _on_image_loaded(self, pil_img: Image.Image, counter: int):
+        if counter != self._image_load_counter:
+            return  # stale result
+        self._loading = False
+        self.photo_image = ImageTk.PhotoImage(pil_img)
         self.canvas.delete("all")
-        cw = self.canvas.winfo_width()
-        ch = self.canvas.winfo_height()
-        x = cw // 2
-        y = ch // 2
-        self.canvas.create_image(x, y, image=self.photo_image, anchor=tk.CENTER)
-
+        cw = max(self.canvas.winfo_width(), 1)
+        ch = max(self.canvas.winfo_height(), 1)
+        self.canvas.create_image(
+            cw // 2, ch // 2, image=self.photo_image, anchor="center"
+        )
         if not self.untimed:
             self.time_remaining_ms = self.interval_ms
             self._update_countdown_display()
 
-    def _resize_to_fit(self, img: Image.Image) -> Image.Image:
+    def _on_image_error(self, exc: Exception, counter: int):
+        if counter != self._image_load_counter:
+            return
+        self._loading = False
+        self.canvas.delete("all")
         cw = max(self.canvas.winfo_width(), 1)
         ch = max(self.canvas.winfo_height(), 1)
+        self.canvas.create_text(
+            cw // 2,
+            ch // 2,
+            text=f"Unable to load image:\n{exc}",
+            fill="#ef4444",
+            font=("Inter", 13),
+            justify="center",
+        )
+
+    def _resize_to_fit(self, img: Image.Image, cw: int, ch: int) -> Image.Image:
         iw, ih = img.size
         ratio = min(cw / iw, ch / ih, 1.0)
         new_w = int(iw * ratio)
         new_h = int(ih * ratio)
         return img.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
-    def _on_resize(self, event=None):
-        if self.slideshow_frame.winfo_ismapped() and self.images:
-            self._show_image(self.current_index)
+    def _on_resize(self, event: tk.Event | None = None):
+        if event and event.widget is not self.root:
+            return
+        if not self.slideshow_frame.winfo_ismapped() or not self.images or self._loading:
+            return
+        # Debounce rapid resize events
+        if self.resize_after_id is not None:
+            self.root.after_cancel(self.resize_after_id)
+        self.resize_after_id = self.root.after(
+            250, lambda: self._show_image(self.current_index)
+        )
 
+    # ------------------------------------------------------------------
+    # Rotation
+    # ------------------------------------------------------------------
+    def _rotate_left(self):
+        self._rotation_angle = (self._rotation_angle - 90) % 360
+        self._show_image(self.current_index)
+
+    def _rotate_right(self):
+        self._rotation_angle = (self._rotation_angle + 90) % 360
+        self._show_image(self.current_index)
+
+    # ------------------------------------------------------------------
+    # Navigation / controls
+    # ------------------------------------------------------------------
     def _advance(self):
         if self.images:
+            self._rotation_angle = 0
             self._show_image(self.current_index + 1)
             if not self.untimed and not self.paused:
                 self._cancel_tick()
@@ -441,6 +475,7 @@ class ImageViewerApp:
 
     def _go_back(self):
         if self.images:
+            self._rotation_angle = 0
             self._show_image(self.current_index - 1)
             if not self.untimed and not self.paused:
                 self._cancel_tick()
@@ -451,16 +486,16 @@ class ImageViewerApp:
             return
         self.paused = not self.paused
         if self.paused:
-            self.pause_btn.config(text="Play", **BUTTON_STYLE)
+            self.pause_btn.configure(text="Play", fg_color="#059669", hover_color="#047857")
             self._cancel_tick()
         else:
-            self.pause_btn.config(text="Pause", **TOGGLE_ON_STYLE)
+            self.pause_btn.configure(text="Pause", fg_color="#6366f1", hover_color="#4f46e5")
             self._schedule_tick()
 
     def _toggle_shuffle(self):
         self.shuffle = not self.shuffle
         text = "Shuffle: ON" if self.shuffle else "Shuffle: OFF"
-        self.shuffle_btn.config(text=text)
+        self.shuffle_btn.configure(text=text)
         if self.images:
             current_path = self.images[self.current_index]
             self._load_images(self.folder_path_var.get())
@@ -468,6 +503,9 @@ class ImageViewerApp:
                 self.current_index = self.images.index(current_path)
             self._show_image(self.current_index)
 
+    # ------------------------------------------------------------------
+    # Timer logic
+    # ------------------------------------------------------------------
     def _schedule_tick(self):
         self._cancel_tick()
         self.after_id = self.root.after(100, self._tick)
@@ -489,33 +527,33 @@ class ImageViewerApp:
 
     def _update_countdown_display(self):
         if self.untimed:
-            self.countdown_label.config(text="")
+            self.countdown_label.configure(text="")
             return
         seconds = max(0, self.time_remaining_ms) // 1000
-        self.countdown_label.config(text=f"{seconds}s")
+        self.countdown_label.configure(text=f"{seconds}s remaining")
 
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Screen switching
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------
     def _show_setup(self):
         self._cancel_tick()
         self.slideshow_frame.grid_forget()
-        self.setup_frame.pack(fill=tk.BOTH, expand=True)
-        self.root.title("Image Viewer – Setup")
+        self.setup_frame.grid(row=0, column=0, sticky="nsew")
+        self.root.title("Image Viewer")
 
     def _show_slideshow(self):
-        self.setup_frame.pack_forget()
+        self.setup_frame.grid_forget()
         self.slideshow_frame.grid(row=0, column=0, sticky="nsew")
-        self.root.title("Image Viewer – Slideshow")
-        self.root.grid_rowconfigure(0, weight=1)
-        self.root.grid_columnconfigure(0, weight=1)
+        self.root.title("Image Viewer — Slideshow")
+        # Reset pause button to default state
+        self.pause_btn.configure(text="Pause", fg_color="#6366f1", hover_color="#4f46e5")
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # Entry point
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 def main():
-    root = tk.Tk()
+    root = ctk.CTk()
     app = ImageViewerApp(root)
     root.mainloop()
 

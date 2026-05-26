@@ -1,22 +1,22 @@
-# Image Viewer – Linux Install Guide
+# Image Viewer — Linux Install Guide
 
-A simple GUI image viewer with timed slideshow, shuffle, and subfolder scanning.
+A modern GUI image viewer with timed slideshow, shuffle, rotation, and subfolder scanning.
 
 ## Requirements
 
 - Python 3.8 or newer
 - tkinter (usually bundled with Python on most Linux distros)
-- Pillow (Python Imaging Library)
+- Pillow and customtkinter
 
 ## 1. Download the files
 
-Copy these three files to your Linux machine (e.g., into `~/image-viewer/`):
+Copy these files to your Linux machine (e.g., into `~/image-viewer/`):
 
 - `image_viewer.py`
 - `requirements.txt`
-- `INSTALL.md`
+- `install.md`
 
-## 2. Install Pillow
+## 2. Install dependencies
 
 Open a terminal in the folder and run:
 
@@ -24,10 +24,11 @@ Open a terminal in the folder and run:
 pip3 install -r requirements.txt
 ```
 
-Or, if you prefer to install system-wide:
+Or install system-wide:
 
 ```bash
 sudo apt update && sudo apt install -y python3-pil python3-pil.imagetk
+pip3 install customtkinter
 ```
 
 > **Note:** If you get a `tkinter` error, install it first:
@@ -35,13 +36,22 @@ sudo apt update && sudo apt install -y python3-pil python3-pil.imagetk
 > sudo apt install -y python3-tk
 > ```
 
-## 3. Make it executable
+## 3. Optional — Better file picker
+
+On Linux the app will try to use **Zenity** (a GTK file chooser) for the folder browser.
+If Zenity is not installed it falls back to the standard tkinter dialog.
+
+```bash
+sudo apt install -y zenity
+```
+
+## 4. Make it executable
 
 ```bash
 chmod +x image_viewer.py
 ```
 
-## 4. Run it
+## 5. Run it
 
 ```bash
 ./image_viewer.py
@@ -53,7 +63,17 @@ Or:
 python3 image_viewer.py
 ```
 
-## Optional – Create a desktop shortcut
+## Controls
+
+| Key | Action |
+|-----|--------|
+| `Left` / `Right` arrows | Previous / next image |
+| `Space` | Pause / play slideshow |
+| `r` | Rotate image 90° clockwise |
+| `R` (Shift+R) | Rotate image 90° counter-clockwise |
+| `Escape` | Back to setup |
+
+## Optional — Create a desktop shortcut
 
 Create a file named `image-viewer.desktop`:
 
